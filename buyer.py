@@ -304,12 +304,40 @@ def _wait_userop(w3: Web3, userop_hash: str, timeout_seconds: int = 120):
 def _build_opensea_mint(slug: str, wallet: str, quantity: int, api_key: str) -> dict:
     if not slug:
         raise RuntimeError("slug فارغ")
-    r = requests.post(
-        f"https://api.opensea.io/api/v2/drops/{slug}/mint",
-        headers={"x-api-key": api_key, "content-type": "application/json", "accept": "application/json"},
-        json={"minter": Web3.to_checksum_address(wallet), "quantity": int(quantity)},
-        timeout=15,
-    )
+
+    # معالجة HTTP 429 فقط: نحترم Retry-After إن أرسلته OpenSea،
+    # وإلا نستخدم تأخيرًا تدريجيًا حتى لا نكرر الطلب بسرعة ونحصل على 429 متتالٍ.
+    max_retries_429 = 5
+    retry_delay = 2.0
+
+    for attempt in range(max_retries_429 + 1):
+        r = requests.post(
+            f"https://api.opensea.io/api/v2/drops/{slug}/mint",
+            headers={"x-api-key": api_key, "content-type": "application/json", "accept": "application/json"},
+            json={"minter": Web3.to_checksum_address(wallet), "quantity": int(quantity)},
+            timeout=15,
+        )
+
+        if r.status_code != 429:
+            break
+
+        if attempt >= max_retries_429:
+            raise RuntimeError(f"OpenSea mint HTTP 429: {r.text[:800]}")
+
+        retry_after = r.headers.get("Retry-After")
+        try:
+            wait_seconds = max(1.0, float(retry_after)) if retry_after is not None else retry_delay
+        except (TypeError, ValueError):
+            wait_seconds = retry_delay
+
+        wait_seconds = min(wait_seconds, 60.0)
+        log.warning(
+            f"[OpenSea 429] Rate limit — إعادة المحاولة بعد {wait_seconds:.1f} ثانية "
+            f"({attempt + 1}/{max_retries_429})."
+        )
+        time.sleep(wait_seconds)
+        retry_delay = min(retry_delay * 2.0, 30.0)
+
     if r.status_code != 200:
         raise RuntimeError(f"OpenSea mint HTTP {r.status_code}: {r.text[:800]}")
     data = r.json()
@@ -321,120 +349,6 @@ def _build_opensea_mint(slug: str, wallet: str, quantity: int, api_key: str) -> 
     if isinstance(value, str):
         value = int(value, 16) if value.startswith("0x") else int(value)
     return {"to": Web3.to_checksum_address(target), "data": calldata, "value": int(value)}
-
-
-def _as_int(value, default=0) -> int:
-    """Convert common RPC/JSON numeric representations to int."""
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return default
-        return int(value, 16) if value.lower().startswith("0x") else int(value)
-    return default
-
-
-def _rpc_personal_sign(w3: Web3, message, wallet: str) -> str:
-    """
-    Sign exactly the payload returned by prepareSponsoredExecution using the
-    JSON-RPC personal_sign method. The wallet/provider, not the bot, owns the
-    signing policy.
-    """
-    if isinstance(message, bytes):
-        message = "0x" + message.hex()
-    elif not isinstance(message, str):
-        raise RuntimeError("prepareSponsoredExecution أعاد رسالة توقيع غير صالحة")
-    return str(_rpc_call(w3, "personal_sign", [message, wallet]))
-
-
-def _extract_prepared_execution(prepared: dict) -> dict:
-    """
-    Normalize the common response shapes used by sponsored-execution providers.
-    No UserOperation is rebuilt here; the provider remains authoritative.
-    """
-    if not isinstance(prepared, dict):
-        raise RuntimeError("prepareSponsoredExecution أعاد استجابة غير صالحة")
-
-    # Some providers wrap the actual execution object.
-    execution = (
-        prepared.get("execution")
-        or prepared.get("sponsoredExecution")
-        or prepared.get("userOperation")
-        or prepared.get("userOp")
-        or prepared
-    )
-    if not isinstance(execution, dict):
-        raise RuntimeError("prepareSponsoredExecution أعاد execution غير صالح")
-
-    signing_message = (
-        prepared.get("signingMessage")
-        or prepared.get("message")
-        or prepared.get("personalSignMessage")
-        or execution.get("signingMessage")
-        or execution.get("message")
-        or execution.get("personalSignMessage")
-        or prepared.get("userOpHash")
-        or execution.get("userOpHash")
-    )
-
-    gas_limit = (
-        execution.get("gasLimit")
-        or execution.get("totalGasLimit")
-        or prepared.get("gasLimit")
-        or prepared.get("totalGasLimit")
-    )
-    max_fee_per_gas = (
-        execution.get("maxFeePerGas")
-        or prepared.get("maxFeePerGas")
-        or execution.get("maxFeePerGasWei")
-        or prepared.get("maxFeePerGasWei")
-    )
-
-    userop_hash = (
-        prepared.get("userOpHash")
-        or prepared.get("userOperationHash")
-        or execution.get("userOpHash")
-        or execution.get("userOperationHash")
-    )
-
-    return {
-        "execution": execution,
-        "signing_message": signing_message,
-        "gas_limit": _as_int(gas_limit),
-        "max_fee_per_gas": _as_int(max_fee_per_gas),
-        "userop_hash": userop_hash,
-    }
-
-
-def _wait_transaction_receipt(w3: Web3, tx_hash: str, timeout_seconds: int = 180):
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        try:
-            receipt = w3.eth.get_transaction_receipt(tx_hash)
-            if receipt:
-                return receipt
-        except Exception:
-            pass
-        time.sleep(2)
-    return None
-
-
-def _receipt_actual_gas_cost_wei(receipt) -> int:
-    gas_used = _as_int(receipt.get("gasUsed") if hasattr(receipt, "get") else None)
-    effective_gas_price = _as_int(
-        receipt.get("effectiveGasPrice") if hasattr(receipt, "get") else None
-    )
-    if not effective_gas_price and hasattr(receipt, "get"):
-        effective_gas_price = _as_int(receipt.get("gasPrice"))
-    return gas_used * effective_gas_price
-
 
 def attempt_purchase(
     w3: Web3,
@@ -497,211 +411,119 @@ def attempt_purchase(
     total_value = price_wei_per_token * quantity
 
     try:
-        # OpenSea's Drops API supplies the exact eligible SeaDrop call.
-        # The slug is intentionally kept as an input to attempt_purchase because
-        # main.py discovers and passes it.
+        # OpenSea email wallets can operate as ERC-4337 smart accounts.
+        # Build the same kind of UserOperation instead of trying to send an
+        # ordinary EOA transaction from a contract/delegated wallet.
+        entry_point = w3.eth.contract(address=ENTRY_POINT_V07, abi=ENTRY_POINT_ABI)
+        nonce = int(entry_point.functions.getNonce(checksum_wallet, 0).call())
+
+        # OpenSea's Drops API supplies the exact eligible SeaDrop call (including
+        # the correct fee recipient and any stage-specific calldata). This avoids
+        # rebuilding stage rules locally.
         api_key = (opensea_api_key or __import__("os").environ.get("OPENSEA_API_KEY", "")).strip()
-        if not slug:
-            return {
-                "success": False,
-                "reason": "slug_required",
-                "error": "يجب تمرير slug إلى attempt_purchase لاستخدام مسار OpenSea Email Wallet.",
-            }
-        if not api_key:
-            return {
-                "success": False,
-                "reason": "opensea_api_key_missing",
-                "error": "OPENSEA_API_KEY غير موجود.",
-            }
+        if slug and api_key:
+            mint = _build_opensea_mint(slug, checksum_wallet, quantity, api_key)
+            target = mint["to"]
+            inner_call = mint["data"]
+            total_value = mint["value"]
+            # Execute the API-built call from the delegated smart account.
+            smart_account = w3.eth.contract(address=checksum_wallet, abi=SMART_ACCOUNT_ABI)
+            call_data = smart_account.functions.execute(
+                target,
+                total_value,
+                inner_call,
+            )._encode_transaction_data()
+        else:
+            seadrop = w3.eth.contract(address=SEADROP_ADDRESS, abi=SEADROP_ABI)
+            inner_call = seadrop.functions.mintPublic(
+                checksum_contract,
+                Web3.to_checksum_address(fee_recipient),
+                ZERO_ADDRESS,
+                quantity,
+            )._encode_transaction_data()
+            smart_account = w3.eth.contract(address=checksum_wallet, abi=SMART_ACCOUNT_ABI)
+            call_data = smart_account.functions.execute(
+                SEADROP_ADDRESS,
+                total_value,
+                inner_call,
+            )._encode_transaction_data()
 
-        mint = _build_opensea_mint(slug, checksum_wallet, quantity, api_key)
-        target = mint["to"]
-        calldata = mint["data"]
-        total_value = mint["value"]
-
-        # 1) Simulate the exact transaction returned by OpenSea before asking
-        # the sponsored-execution service to prepare it.
-        simulation = {
-            "from": checksum_wallet,
-            "to": target,
-            "data": calldata,
-            "value": total_value,
-        }
-        try:
-            w3.eth.call(simulation)
-        except Exception as e:
-            log.info(f"[المحاكاة] معاملة Mint ستفشل: {e}")
-            return {
-                "success": False,
-                "reason": "simulation_failed",
-                "error": str(e),
-                "quantity": quantity,
-                "total_value_wei": total_value,
-            }
-
-        # 2) Estimate the actual execution gas for the OpenSea-built call.
-        try:
-            estimated_call_gas = int(w3.eth.estimate_gas(simulation))
-        except Exception as e:
-            log.error(f"[تقدير الغاز] تعذر تقدير الغاز: {e}")
-            return {"success": False, "reason": "gas_estimation_failed", "error": str(e)}
+        init_code = _get_7702_init_code(w3, checksum_wallet)
 
         gas_price = int(w3.eth.gas_price)
-        preliminary_gas_fee_usd = (
-            estimated_call_gas * gas_price / 1e18
-        ) * eth_price_usd
+        try:
+            priority = int(_rpc_call(w3, "rundler_maxPriorityFeePerGas", []), 16)
+            gas_price = max(gas_price, priority)
+        except Exception:
+            pass
 
-        # Reject before any sponsored execution is prepared/submitted.
-        if preliminary_gas_fee_usd > max_gas_fee_usd:
-            log.info(
-                f"[تأجيل] الغاز المتوقع ${preliminary_gas_fee_usd:.4f} "
-                f"> الحد ${max_gas_fee_usd}."
-            )
-            return {
-                "success": False,
-                "reason": "gas_too_high",
-                "gas_fee_usd": preliminary_gas_fee_usd,
-                "estimated_gas": estimated_call_gas,
-            }
+        userop = _build_userop(checksum_wallet, nonce, call_data, gas_price, init_code)
 
-
-        prepare_payload = {
-            "from": checksum_wallet,
-            "to": target,
-            "data": calldata,
-            "value": hex(total_value),
-            "chainId": hex(int(w3.eth.chain_id)),
-            "gasLimit": hex(estimated_call_gas),
-        }
-
-        prepared = _rpc_call(
+        # Bundler gas estimation. The RPC endpoint used by main.py is also
+        # capable of the standard ERC-4337 bundler methods on supported chains.
+        estimated = _rpc_call(
             w3,
-            "prepareSponsoredExecution",
-            [prepare_payload],
+            "eth_estimateUserOperationGas",
+            [userop, ENTRY_POINT_V07],
         )
-        normalized = _extract_prepared_execution(prepared)
+        userop["callGasLimit"] = _hex(int(estimated["callGasLimit"]))
+        userop["verificationGasLimit"] = _hex(int(estimated["verificationGasLimit"]))
+        userop["preVerificationGas"] = _hex(int(estimated["preVerificationGas"]))
 
-        signing_message = normalized["signing_message"]
-        if not signing_message:
-            raise RuntimeError(
-                "prepareSponsoredExecution لم يُرجع signingMessage/message لـ personal_sign"
-            )
+        # Sign the final UserOperation hash with the wallet's private key.
+        userop["signature"] = _sign_userop(private_key, _userop_hash(w3, userop))
 
-        sponsored_gas_limit = normalized["gas_limit"] or estimated_call_gas
-        sponsored_max_fee = normalized["max_fee_per_gas"] or gas_price
-        sponsored_gas_fee_usd = (
-            sponsored_gas_limit * sponsored_max_fee / 1e18
-        ) * eth_price_usd
+        gas_units = (
+            int(userop["callGasLimit"], 16)
+            + int(userop["verificationGasLimit"], 16)
+            + int(userop["preVerificationGas"], 16)
+        )
+        estimated_gas_fee_usd = (gas_units * gas_price / 1e18) * eth_price_usd
+        if estimated_gas_fee_usd > max_gas_fee_usd:
+            log.info(f"[تأجيل] رسوم UserOperation ${estimated_gas_fee_usd:.4f} > الحد ${max_gas_fee_usd}.")
+            return {"success": False, "reason": "gas_too_high", "gas_fee_usd": estimated_gas_fee_usd}
 
-        # 4) Final gas-limit check using the limits returned by the sponsored
-        # execution preparation.
-        if sponsored_gas_fee_usd > max_gas_fee_usd:
-            log.info(
-                f"[تأجيل] رسوم Sponsored Execution ${sponsored_gas_fee_usd:.4f} "
-                f"> الحد ${max_gas_fee_usd}."
-            )
-            return {
-                "success": False,
-                "reason": "gas_too_high",
-                "gas_fee_usd": sponsored_gas_fee_usd,
-                "estimated_gas": sponsored_gas_limit,
-            }
+        wallet_balance_wei = w3.eth.get_balance(checksum_wallet)
+        total_cost_wei = total_value + gas_units * gas_price
+        if wallet_balance_wei < total_cost_wei:
+            log.warning("[إلغاء] الرصيد لا يكفي لتغطية سعر المينت والغاز.")
+            return {"success": False, "reason": "insufficient_funds_for_total_cost"}
 
-        # 5) Sign exactly what the provider asked for with personal_sign.
-        signature = _rpc_personal_sign(
+        submitted_hash = _rpc_call(
             w3,
-            signing_message,
-            checksum_wallet,
+            "eth_sendUserOperation",
+            [userop, ENTRY_POINT_V07],
         )
+        log.info(f"[UserOperation مرسلة] {submitted_hash} — كمية: {quantity}")
 
-        # 6) Submit the prepared sponsored execution. The provider supplies the
-        # VerifyingPaymaster data and forwards the UserOperation to its Bundler.
-        submit_payload = {
-            "execution": normalized["execution"],
-            "signature": signature,
-        }
-
-        submitted = _rpc_call(
-            w3,
-            "submitSponsoredExecution",
-            [submit_payload],
-        )
-
-        if isinstance(submitted, dict):
-            userop_hash = (
-                submitted.get("userOpHash")
-                or submitted.get("userOperationHash")
-                or normalized["userop_hash"]
-            )
-            tx_hash = (
-                submitted.get("txHash")
-                or submitted.get("transactionHash")
-            )
-        else:
-            userop_hash = normalized["userop_hash"]
-            tx_hash = submitted if isinstance(submitted, str) else None
-
-        log.info(
-            f"[Sponsored Execution مرسلة] "
-            f"userOp={userop_hash or 'unknown'} — كمية: {quantity}"
-        )
-
-        # 7) Wait for the final transaction receipt. Prefer the transaction hash
-        # returned by the sponsored service; otherwise wait for the UserOperation
-        # receipt and obtain its underlying transaction hash.
-        receipt = None
-        if tx_hash:
-            receipt = _wait_transaction_receipt(w3, tx_hash)
-
-        if receipt is None and userop_hash:
-            userop_receipt = _wait_userop(w3, userop_hash)
-            if userop_receipt:
-                if not userop_receipt.get("success", False):
-                    return {
-                        "success": False,
-                        "reason": "userop_reverted",
-                        "userop_hash": userop_hash,
-                        "error": userop_receipt.get("reason"),
-                    }
-                tx_hash = (
-                    (userop_receipt.get("receipt") or {}).get("transactionHash")
-                    or tx_hash
-                )
-                if tx_hash:
-                    receipt = _wait_transaction_receipt(w3, tx_hash)
-
-        if receipt is None:
+        receipt = _wait_userop(w3, submitted_hash)
+        if receipt:
+            if not receipt.get("success", False):
+                return {
+                    "success": False,
+                    "reason": "userop_reverted",
+                    "userop_hash": submitted_hash,
+                    "error": receipt.get("reason"),
+                }
+            actual_gas_cost_wei = int(receipt.get("actualGasCost", "0x0"), 16)
+            tx_hash = (receipt.get("receipt") or {}).get("transactionHash")
             return {
-                "success": False,
-                "reason": "receipt_timeout",
+                "success": True,
                 "tx_hash": tx_hash,
-                "userop_hash": userop_hash,
+                "userop_hash": submitted_hash,
                 "quantity": quantity,
+                "gas_fee_usd": (actual_gas_cost_wei / 1e18) * eth_price_usd,
                 "total_value_wei": total_value,
             }
-
-        receipt_status = _as_int(receipt.get("status"), 1)
-        if receipt_status != 1:
-            return {
-                "success": False,
-                "reason": "transaction_reverted",
-                "tx_hash": tx_hash,
-                "userop_hash": userop_hash,
-                "quantity": quantity,
-            }
-
-        # 8) Calculate the actual gas used from the final receipt, not from the
-        # estimate.
-        actual_gas_cost_wei = _receipt_actual_gas_cost_wei(receipt)
 
         return {
             "success": True,
-            "tx_hash": tx_hash,
-            "userop_hash": userop_hash,
+            "tx_hash": None,
+            "userop_hash": submitted_hash,
             "quantity": quantity,
-            "gas_fee_usd": (actual_gas_cost_wei / 1e18) * eth_price_usd,
+            "gas_fee_usd": estimated_gas_fee_usd,
             "total_value_wei": total_value,
-            "actual_gas_used": _as_int(receipt.get("gasUsed")),
+            "pending": True,
         }
 
     except Exception as e:
