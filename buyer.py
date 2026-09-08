@@ -505,3 +505,4 @@ def attempt_purchase(
             return {"success": False, "reason": "not_active", "error": error_text}
         log.error(f"[خطأ إرسال] {e}")
         return {"success": False, "reason": "tx_error", "error": error_text}
+
