@@ -332,6 +332,8 @@ def attempt_purchase(
     remaining_supply: int,
     eth_price_usd: float,
     max_gas_fee_usd: float,
+    slug: str | None = None,
+    opensea_api_key: str | None = None,
 ) -> dict:
     """
     max_gas_fee_usd يُمرَّر من main.py حسب الشبكة (كل شبكة لها حدها الخاص).
