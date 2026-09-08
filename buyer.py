@@ -561,6 +561,8 @@ def attempt_purchase(
                 "success": False,
                 "reason": "gas_too_high",
                 "gas_fee_usd": preliminary_gas_fee_usd,
+                "estimated_gas": estimated_call_gas,
+            }
 
 
         prepare_payload = {
